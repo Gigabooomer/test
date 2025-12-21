@@ -1,0 +1,106 @@
+# syntax=docker/dockerfile:1.7
+
+ARG BIN=promotion_service
+
+############################
+# 1. cargo-chef base (Alpine)
+############################
+FROM lukemathwalker/cargo-chef:latest-rust-alpine AS chef
+WORKDIR /app
+
+ARG REGISTRY_URL
+ARG REGISTRY_TOKEN
+
+ENV SQLX_OFFLINE=true
+
+# Private registry (BUILD STAGES ONLY)
+RUN mkdir -p /root/.cargo && \
+    printf '[registries.birdy]\nindex = "sparse+%s/api/v1/crates/"\ncredential-provider = ["cargo:token"]\n\n[registry]\ntoken = "%s"\n' \
+    "$REGISTRY_URL" "$REGISTRY_TOKEN" \
+    > /root/.cargo/config.toml
+
+############################
+# 2. Planner
+############################
+FROM chef AS planner
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY .sqlx ./.sqlx
+
+RUN cargo chef prepare --recipe-path recipe.json
+
+############################
+# 3. Builder
+############################
+FROM chef AS builder
+
+# build deps (NOT runtime)
+RUN apk add --no-cache \
+    musl-dev \
+    build-base \
+    pkgconfig \
+    openssl-dev
+
+# deps cache
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook \
+    --release \
+    --target x86_64-unknown-linux-musl \
+    --recipe-path recipe.json
+
+# source
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY migrations ./migrations
+COPY .sqlx ./.sqlx
+
+# build app
+RUN cargo build \
+    --release \
+    --target x86_64-unknown-linux-musl \
+    --bin ${BIN} \
+ && strip target/x86_64-unknown-linux-musl/release/${BIN}
+
+# build sqlx-cli (minimal features)
+RUN cargo install sqlx-cli \
+    --no-default-features \
+    --features rustls,postgres \
+    --locked
+
+############################
+# 4. Runtime (Alpine + sqlx)
+############################
+FROM alpine:3.20
+
+# Runtime deps ONLY
+RUN apk add --no-cache \
+    ca-certificates \
+    libgcc \
+    libstdc++
+
+WORKDIR /app
+
+# App binary
+COPY --from=builder \
+  /app/target/x86_64-unknown-linux-musl/release/${BIN} \
+  /app/${BIN}
+
+# sqlx-cli binary only
+COPY --from=builder /root/.cargo/bin/sqlx /usr/local/bin/sqlx
+
+# migrations
+COPY migrations ./migrations
+
+# entrypoint
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+# non-root user
+RUN addgroup -S app && adduser -S app -G app
+USER app
+
+EXPOSE 8080
+ENV RUST_LOG=info
+
+ENTRYPOINT ["/entrypoint.sh"]
