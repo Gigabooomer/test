@@ -11,23 +11,23 @@ WORKDIR /app
 ARG REGISTRY_URL
 ARG REGISTRY_TOKEN
 
-ENV SQLX_OFFLINE=true
-
-# Private registry (BUILD STAGES ONLY)
+# ---- Private registry (must exist BEFORE planner) ----
 RUN mkdir -p /root/.cargo && \
-    printf '[registries.birdy]\nindex = "sparse+%s/api/v1/crates/"\ncredential-provider = ["cargo:token"]\n\n[registry]\ntoken = "%s"\n' \
-    "$REGISTRY_URL" "$REGISTRY_TOKEN" \
-    > /root/.cargo/config.toml
+    cat > /root/.cargo/config.toml <<'EOF'
+[registries.birdy]
+index = "sparse+${REGISTRY_URL}/api/v1/crates/"
+credential-provider = ["cargo:token"]
+
+[registry]
+token = "${REGISTRY_TOKEN}"
+EOF
 
 ############################
 # 2. Planner
 ############################
 FROM chef AS planner
-
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-COPY .sqlx ./.sqlx
-
 RUN cargo chef prepare --recipe-path recipe.json
 
 ############################
@@ -35,45 +35,44 @@ RUN cargo chef prepare --recipe-path recipe.json
 ############################
 FROM chef AS builder
 
-# build deps (NOT runtime)
+# Build-only dependencies (NOT in runtime)
 RUN apk add --no-cache \
     musl-dev \
     build-base \
     pkgconfig \
     openssl-dev
 
-# deps cache
+# Dependency cache
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook \
     --release \
     --target x86_64-unknown-linux-musl \
     --recipe-path recipe.json
 
-# source
+# Application source
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
-COPY .sqlx ./.sqlx
 
-# build app
+# Build binary
 RUN cargo build \
     --release \
     --target x86_64-unknown-linux-musl \
     --bin ${BIN} \
  && strip target/x86_64-unknown-linux-musl/release/${BIN}
 
-# build sqlx-cli (minimal features)
+# Build sqlx-cli (for runtime migrations)
 RUN cargo install sqlx-cli \
     --no-default-features \
     --features rustls,postgres \
     --locked
 
 ############################
-# 4. Runtime (Alpine + sqlx)
+# 4. Runtime (Alpine, small)
 ############################
 FROM alpine:3.20
 
-# Runtime deps ONLY
+# Runtime deps only
 RUN apk add --no-cache \
     ca-certificates \
     libgcc \
@@ -89,14 +88,14 @@ COPY --from=builder \
 # sqlx-cli binary only
 COPY --from=builder /root/.cargo/bin/sqlx /usr/local/bin/sqlx
 
-# migrations
+# Migrations
 COPY migrations ./migrations
 
-# entrypoint
+# Entrypoint
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# non-root user
+# Non-root user
 RUN addgroup -S app && adduser -S app -G app
 USER app
 
