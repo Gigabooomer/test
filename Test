@@ -1,0 +1,73 @@
+# syntax=docker/dockerfile:1.7
+
+ARG RUST_VERSION=1.88
+ARG BIN=promotion_service
+
+############################
+# 1. Chef base (build only)
+############################
+FROM lukemathwalker/cargo-chef:0.1.67-rust-${RUST_VERSION}-alpine AS chef
+WORKDIR /app
+
+ARG REGISTRY_URL
+ARG REGISTRY_TOKEN
+
+ENV SQLX_OFFLINE=true
+
+# Registry config (BUILD STAGE ONLY)
+RUN mkdir -p /root/.cargo && \
+    printf '[registries.birdy]\nindex = "sparse+%s/api/v1/crates/"\ncredential-provider = ["cargo:token"]\n\n[registry]\ntoken = "%s"\n' \
+    "$REGISTRY_URL" "$REGISTRY_TOKEN" \
+    > /root/.cargo/config.toml
+
+############################
+# 2. Planner
+############################
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY crates ./crates
+RUN cargo chef prepare --recipe-path recipe.json
+
+############################
+# 3. Builder
+############################
+FROM chef AS builder
+
+RUN apk add --no-cache \
+    musl-dev \
+    build-base \
+    pkgconfig \
+    openssl-dev
+
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
+
+COPY . .
+
+RUN cargo build \
+    --release \
+    --target x86_64-unknown-linux-musl \
+    --bin ${BIN} \
+ && strip target/x86_64-unknown-linux-musl/release/${BIN}
+
+############################
+# 4. Runtime (tiny)
+############################
+FROM alpine:3.20
+
+# certs only
+RUN apk add --no-cache ca-certificates
+
+WORKDIR /app
+
+# Binary only — NOTHING ELSE
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/${BIN} /app/${BIN}
+
+# Non-root user
+RUN addgroup -S app && adduser -S app -G app
+USER app
+
+EXPOSE 8080
+ENV RUST_LOG=info
+
+ENTRYPOINT ["/app/promotion_service"]
