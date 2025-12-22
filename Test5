@@ -1,0 +1,90 @@
+# syntax=docker/dockerfile:1.7
+
+ARG BIN=business_service
+ARG REGISTRY_URL
+ARG REGISTRY_TOKEN
+
+############################
+# Chef
+############################
+FROM lukemathwalker/cargo-chef:latest-rust-1-alpine AS chef
+WORKDIR /app
+
+ARG REGISTRY_URL
+ARG REGISTRY_TOKEN
+
+ENV RUST_BACKTRACE=1
+ENV SQLX_OFFLINE=true
+
+RUN mkdir -p /home/rust/.cargo && \
+    cat > /home/rust/.cargo/config.toml <<EOF
+[registries.birdy]
+index = "sparse+${REGISTRY_URL}/api/v1/crates/"
+credential-provider = ["cargo:token"]
+token = "${REGISTRY_TOKEN}"
+EOF
+
+############################
+# Planner
+############################
+FROM lukemathwalker/cargo-chef:latest-rust-1-alpine AS planner
+WORKDIR /app
+
+COPY --from=chef /home/rust/.cargo /home/rust/.cargo
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+RUN cargo chef prepare --recipe-path recipe.json
+
+############################
+# Builder
+############################
+FROM lukemathwalker/cargo-chef:latest-rust-1-alpine AS builder
+WORKDIR /app
+
+ARG BIN
+
+COPY --from=chef /home/rust/.cargo /home/rust/.cargo
+
+RUN apk add --no-cache \
+    build-base \
+    musl-dev \
+    pkgconfig \
+    openssl-dev
+
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+
+COPY . .
+
+RUN cargo build --release --bin ${BIN}
+
+RUN cargo install sqlx-cli \
+    --no-default-features \
+    --features rustls,postgres
+
+############################
+# Runtime
+############################
+FROM alpine:3.22
+
+ARG BIN
+
+RUN apk add --no-cache \
+    ca-certificates \
+    libgcc \
+    libstdc++ \
+    openssl
+
+WORKDIR /app
+
+COPY --from=builder /app/migrations ./migrations
+COPY --from=builder /app/target/release/${BIN} ./${BIN}
+COPY --from=builder /usr/local/cargo/bin/sqlx /usr/local/bin/sqlx
+COPY entrypoint.sh /app/entrypoint.sh
+
+RUN chmod +x /app/entrypoint.sh
+
+EXPOSE 8080
+ENTRYPOINT ["/app/entrypoint.sh"]
