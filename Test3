@@ -1,0 +1,63 @@
+# syntax=docker/dockerfile:1.7
+
+ARG BIN=promotion_service
+
+############################
+# 1) Chef base (Rust 1.92 on Alpine)
+############################
+FROM lukemathwalker/cargo-chef:latest-rust-1.92-alpine AS chef
+WORKDIR /app
+
+############################
+# 2) Planner
+############################
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+RUN cargo chef prepare --recipe-path recipe.json
+
+############################
+# 3) Builder
+############################
+FROM chef AS builder
+
+# Build-only deps
+RUN apk add --no-cache musl-dev build-base pkgconfig openssl-dev
+
+# Cache dependencies
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
+
+# Build app
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY migrations ./migrations
+RUN cargo build --release --target x86_64-unknown-linux-musl --bin ${BIN} \
+ && strip target/x86_64-unknown-linux-musl/release/${BIN}
+
+# sqlx-cli for runtime migrations (binary only gets copied to runtime)
+RUN cargo install sqlx-cli --no-default-features --features rustls,postgres --locked
+
+############################
+# 4) Runtime (latest stable Alpine series)
+############################
+FROM alpine:3.23.2
+
+RUN apk add --no-cache ca-certificates libgcc libstdc++
+
+WORKDIR /app
+
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/${BIN} /app/${BIN}
+COPY --from=builder /usr/local/cargo/bin/sqlx /usr/local/bin/sqlx
+
+COPY migrations ./migrations
+COPY entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+RUN addgroup -S app && adduser -S app -G app
+USER app
+
+EXPOSE 8080
+ENV RUST_LOG=info
+
+ENTRYPOINT ["/entrypoint.sh"]
