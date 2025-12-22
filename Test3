@@ -1,34 +1,35 @@
 # syntax=docker/dockerfile:1.7
 
 ############################
-# Build arguments
+# Global args (defaults)
 ############################
-ARG BIN=promotion_service
+ARG BIN=business_service
 ARG REGISTRY_URL
 ARG REGISTRY_TOKEN
 
 ############################
-# 1. cargo-chef base
+# 1. Chef base (build only)
 ############################
-FROM lukemathwalker/cargo-chef:latest-rust-1.92-alpine AS chef
+FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef
 WORKDIR /app
 
-# cargo-chef runs as user "rust"
-ENV CARGO_HOME=/home/rust/.cargo
+ARG REGISTRY_URL
+ARG REGISTRY_TOKEN
 
-# ---- Private registry config (must exist BEFORE planner) ----
-RUN mkdir -p ${CARGO_HOME} && \
-    cat > ${CARGO_HOME}/config.toml <<EOF
+ENV RUST_BACKTRACE=1
+ENV SQLX_OFFLINE=true
+
+# Private registry config (build stages only)
+RUN mkdir -p /root/.cargo && \
+    cat > /root/.cargo/config.toml <<EOF
 [registries.birdy]
 index = "sparse+${REGISTRY_URL}/api/v1/crates/"
 credential-provider = ["cargo:token"]
-
-[registry]
 token = "${REGISTRY_TOKEN}"
 EOF
 
 ############################
-# 2. Planner
+# 2. Planner (dependency graph)
 ############################
 FROM chef AS planner
 
@@ -38,75 +39,60 @@ COPY src ./src
 RUN cargo chef prepare --recipe-path recipe.json
 
 ############################
-# 3. Builder
+# 3. Builder (compile)
 ############################
 FROM chef AS builder
 
-# Build-only dependencies
+ARG BIN
+
+# Build dependencies ONLY here
 RUN apk add --no-cache \
-    musl-dev \
     build-base \
+    musl-dev \
     pkgconfig \
     openssl-dev
 
-# Dependency cache
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook \
-    --release \
-    --target x86_64-unknown-linux-musl \
-    --recipe-path recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
 
-# Application source
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
-COPY migrations ./migrations
+# Copy full source AFTER deps are cached
+COPY . .
 
-# Build binary
-RUN cargo build \
-    --release \
-    --target x86_64-unknown-linux-musl \
-    --bin ${BIN} \
- && strip target/x86_64-unknown-linux-musl/release/${BIN}
+RUN cargo build --release --bin ${BIN}
 
-# sqlx-cli (runtime migrations)
+# Install sqlx-cli (needed at runtime for migrations)
 RUN cargo install sqlx-cli \
     --no-default-features \
-    --features rustls,postgres \
-    --locked
+    --features rustls,postgres
 
 ############################
-# 4. Runtime (production)
+# 4. Runtime (small, clean)
 ############################
-FROM alpine:3.23
+FROM alpine:3.22 AS runtime
 
-# Runtime deps only
+ARG BIN
+
+# Runtime deps ONLY (no compilers!)
 RUN apk add --no-cache \
     ca-certificates \
     libgcc \
-    libstdc++
+    libstdc++ \
+    openssl
 
 WORKDIR /app
 
-# Application binary
-COPY --from=builder \
-  /app/target/x86_64-unknown-linux-musl/release/${BIN} \
-  /app/${BIN}
+# Migrations
+COPY --from=builder /app/migrations ./migrations
 
-# sqlx-cli binary only
-COPY --from=builder \
-  /home/rust/.cargo/bin/sqlx \
-  /usr/local/bin/sqlx
+# App binary
+COPY --from=builder /app/target/release/${BIN} ./${BIN}
 
-# Migrations + entrypoint
-COPY migrations ./migrations
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+# sqlx binary
+COPY --from=builder /usr/local/cargo/bin/sqlx /usr/local/bin/sqlx
 
-# Non-root runtime user
-RUN addgroup -S app && adduser -S app -G app
-USER app
+# Entrypoint
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 8080
-ENV RUST_LOG=info
-
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/app/entrypoint.sh"]
