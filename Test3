@@ -1,16 +1,13 @@
 # syntax=docker/dockerfile:1.7
 
-############################
-# Global args (defaults)
-############################
 ARG BIN=business_service
 ARG REGISTRY_URL
 ARG REGISTRY_TOKEN
 
 ############################
-# 1. Chef base (build only)
+# Chef
 ############################
-FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef
+FROM lukemathwalker/cargo-chef:latest-rust-1-alpine AS chef
 WORKDIR /app
 
 ARG REGISTRY_URL
@@ -19,7 +16,6 @@ ARG REGISTRY_TOKEN
 ENV RUST_BACKTRACE=1
 ENV SQLX_OFFLINE=true
 
-# Private registry config (build stages only)
 RUN mkdir -p /root/.cargo && \
     cat > /root/.cargo/config.toml <<EOF
 [registries.birdy]
@@ -29,9 +25,15 @@ token = "${REGISTRY_TOKEN}"
 EOF
 
 ############################
-# 2. Planner (dependency graph)
+# Planner
 ############################
-FROM chef AS planner
+FROM lukemathwalker/cargo-chef:latest-rust-1-alpine AS planner
+WORKDIR /app
+
+ARG REGISTRY_URL
+ARG REGISTRY_TOKEN
+
+COPY --from=chef /root/.cargo /root/.cargo
 
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
@@ -39,59 +41,44 @@ COPY src ./src
 RUN cargo chef prepare --recipe-path recipe.json
 
 ############################
-# 3. Builder (compile)
+# Builder
 ############################
-FROM chef AS builder
+FROM lukemathwalker/cargo-chef:latest-rust-1-alpine AS builder
+WORKDIR /app
 
 ARG BIN
+ARG REGISTRY_URL
+ARG REGISTRY_TOKEN
 
-# Build dependencies ONLY here
-RUN apk add --no-cache \
-    build-base \
-    musl-dev \
-    pkgconfig \
-    openssl-dev
+COPY --from=chef /root/.cargo /root/.cargo
+
+RUN apk add --no-cache build-base musl-dev pkgconfig openssl-dev
 
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --release --recipe-path recipe.json
 
-# Copy full source AFTER deps are cached
 COPY . .
 
 RUN cargo build --release --bin ${BIN}
 
-# Install sqlx-cli (needed at runtime for migrations)
-RUN cargo install sqlx-cli \
-    --no-default-features \
-    --features rustls,postgres
+RUN cargo install sqlx-cli --no-default-features --features rustls,postgres
 
 ############################
-# 4. Runtime (small, clean)
+# Runtime
 ############################
-FROM alpine:3.22 AS runtime
+FROM alpine:3.22
 
 ARG BIN
 
-# Runtime deps ONLY (no compilers!)
-RUN apk add --no-cache \
-    ca-certificates \
-    libgcc \
-    libstdc++ \
-    openssl
+RUN apk add --no-cache ca-certificates libgcc libstdc++ openssl
 
 WORKDIR /app
 
-# Migrations
 COPY --from=builder /app/migrations ./migrations
-
-# App binary
 COPY --from=builder /app/target/release/${BIN} ./${BIN}
-
-# sqlx binary
 COPY --from=builder /usr/local/cargo/bin/sqlx /usr/local/bin/sqlx
-
-# Entrypoint
 COPY entrypoint.sh /app/entrypoint.sh
+
 RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 8080
