@@ -1,59 +1,108 @@
 # syntax=docker/dockerfile:1.7
 
+############################
+# Build arguments
+############################
 ARG BIN=promotion_service
+ARG REGISTRY_URL
+ARG REGISTRY_TOKEN
 
 ############################
-# 1) Chef base (Rust 1.92 on Alpine)
+# 1. cargo-chef base
 ############################
 FROM lukemathwalker/cargo-chef:latest-rust-1.92-alpine AS chef
 WORKDIR /app
 
+# cargo-chef runs as user "rust"
+ENV CARGO_HOME=/home/rust/.cargo
+
+# ---- Private registry config (must exist BEFORE planner) ----
+RUN mkdir -p ${CARGO_HOME} && \
+    cat > ${CARGO_HOME}/config.toml <<EOF
+[registries.birdy]
+index = "sparse+${REGISTRY_URL}/api/v1/crates/"
+credential-provider = ["cargo:token"]
+
+[registry]
+token = "${REGISTRY_TOKEN}"
+EOF
+
 ############################
-# 2) Planner
+# 2. Planner
 ############################
 FROM chef AS planner
+
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+
 RUN cargo chef prepare --recipe-path recipe.json
 
 ############################
-# 3) Builder
+# 3. Builder
 ############################
 FROM chef AS builder
 
-# Build-only deps
-RUN apk add --no-cache musl-dev build-base pkgconfig openssl-dev
+# Build-only dependencies
+RUN apk add --no-cache \
+    musl-dev \
+    build-base \
+    pkgconfig \
+    openssl-dev
 
-# Cache dependencies
+# Dependency cache
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --release --target x86_64-unknown-linux-musl --recipe-path recipe.json
+RUN cargo chef cook \
+    --release \
+    --target x86_64-unknown-linux-musl \
+    --recipe-path recipe.json
 
-# Build app
+# Application source
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
-RUN cargo build --release --target x86_64-unknown-linux-musl --bin ${BIN} \
+
+# Build binary
+RUN cargo build \
+    --release \
+    --target x86_64-unknown-linux-musl \
+    --bin ${BIN} \
  && strip target/x86_64-unknown-linux-musl/release/${BIN}
 
-# sqlx-cli for runtime migrations (binary only gets copied to runtime)
-RUN cargo install sqlx-cli --no-default-features --features rustls,postgres --locked
+# sqlx-cli (runtime migrations)
+RUN cargo install sqlx-cli \
+    --no-default-features \
+    --features rustls,postgres \
+    --locked
 
 ############################
-# 4) Runtime (latest stable Alpine series)
+# 4. Runtime (production)
 ############################
-FROM alpine:3.23.2
+FROM alpine:3.23
 
-RUN apk add --no-cache ca-certificates libgcc libstdc++
+# Runtime deps only
+RUN apk add --no-cache \
+    ca-certificates \
+    libgcc \
+    libstdc++
 
 WORKDIR /app
 
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/${BIN} /app/${BIN}
-COPY --from=builder /usr/local/cargo/bin/sqlx /usr/local/bin/sqlx
+# Application binary
+COPY --from=builder \
+  /app/target/x86_64-unknown-linux-musl/release/${BIN} \
+  /app/${BIN}
 
+# sqlx-cli binary only
+COPY --from=builder \
+  /home/rust/.cargo/bin/sqlx \
+  /usr/local/bin/sqlx
+
+# Migrations + entrypoint
 COPY migrations ./migrations
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
+# Non-root runtime user
 RUN addgroup -S app && adduser -S app -G app
 USER app
 
