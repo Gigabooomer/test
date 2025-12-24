@@ -1,0 +1,78 @@
+# =======================
+# Chef
+# =======================
+FROM lukemathwalker/cargo-chef:latest-rust-1-alpine AS chef
+WORKDIR /app
+
+ARG bin
+ARG REGISTRY_URL
+ARG REGISTRY_TOKEN
+
+ENV RUST_BACKTRACE=1
+ENV SQLX_OFFLINE=true
+
+RUN mkdir -p /app/.cargo && \
+    cat > /app/.cargo/config.toml <<EOF
+[registries.birdy]
+index = "sparse+${REGISTRY_URL}/api/v1/crates/"
+credential-provider = ["cargo:token"]
+token = "${REGISTRY_TOKEN}"
+EOF
+
+# =======================
+# Planner
+# =======================
+FROM chef AS planner
+WORKDIR /app
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+RUN cargo chef prepare --recipe-path recipe.json
+
+# =======================
+# Builder
+# =======================
+FROM chef AS builder
+WORKDIR /app
+
+RUN apk add --no-cache \
+    build-base \
+    musl-dev \
+    pkgconf \
+    openssl-dev \
+    perl
+
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --recipe-path recipe.json
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY migrations ./migrations
+
+RUN cargo build --release --bin ${bin}
+
+RUN cargo install sqlx-cli \
+    --no-default-features \
+    --features rustls,postgres
+
+# =======================
+# Runtime (Alpine)
+# =======================
+FROM alpine:3.22
+WORKDIR /app
+
+RUN apk add --no-cache \
+    ca-certificates \
+    libgcc \
+    libstdc++
+
+COPY --from=builder /app/target/release/${bin} /app/${bin}
+COPY --from=builder /usr/local/cargo/bin/sqlx /usr/local/bin/sqlx
+COPY --from=builder /app/migrations /app/migrations
+
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+EXPOSE 8080
+ENTRYPOINT ["/app/entrypoint.sh"]
